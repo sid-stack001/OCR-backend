@@ -1,12 +1,11 @@
 """
-OCR Backend Service - FastAPI Application (Low Memory Edition)
+OCR Backend Service - FastAPI Application (v9.0 Otsu Edition)
 
-This module implements an optimized OCR pipeline designed for cloud environments
-with limited RAM (e.g., Railway Starter Tier). It features "Smart Downscaling" 
-for AI operations and aggressive garbage collection to prevent OOM errors.
+This version switches to Otsu's Binarization to solve the "Hollow Bold Text" 
+problem found in previous versions. It is robust for bold medical headers.
 
 Author: Siddharth Verma
-Version: 2.0 (Low-RAM Optimization)
+Version: 9.0
 """
 
 import cv2
@@ -19,94 +18,46 @@ from PIL import Image
 import io
 import os
 import re
-import gc  # Explicit garbage collection for memory management
+import gc
 
 app = FastAPI()
 
-# Initialize background removal model (u2netp is the lightweight version)
+# Initialize background removal model
 session = new_session("u2netp")
 
-# Configure Tesseract OCR path for Windows environments
 if os.name == 'nt':
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
 def adjust_gamma(image, gamma=1.0):
-    """
-    Apply gamma correction to adjust image brightness and contrast.
-    
-    Args:
-        image (np.ndarray): Input image (grayscale or color)
-        gamma (float): Gamma value. <1.0 darkens (bolds text), >1.0 lightens.
-    
-    Returns:
-        np.ndarray: Gamma-corrected image
-    """
     invGamma = 1.0 / gamma
     table = np.array([((i / 255.0) ** invGamma) * 255
         for i in np.arange(0, 256)]).astype("uint8")
     return cv2.LUT(image, table)
 
-
 def remove_vertical_lines(image):
-    """
-    Remove vertical table lines while preserving text integrity.
-    
-    Updated for v8.0: Kernel height reduced to 40px to match the lower 
-    target resolution (2000px width).
-    
-    Args:
-        image (np.ndarray): Binary image (text on white background)
-    
-    Returns:
-        np.ndarray: Image with vertical lines removed
-    """
-    # Kernel: 1px wide, 40px tall (Detects vertical structures)
+    # Kernel: 1px wide, 40px tall
     vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
     detected_lines = cv2.morphologyEx(image, cv2.MORPH_OPEN, vertical_kernel)
     result = cv2.add(image, detected_lines)
     return result
 
-
 def clean_text_for_llm(raw_text):
-    """
-    Clean OCR output text for downstream LLM processing.
-    
-    Removes visual noise artifacts (grid lines, empty brackets) that 
-    confuse language models.
-    
-    Args:
-        raw_text (str): Raw OCR output from Tesseract
-    
-    Returns:
-        str: Cleaned text ready for LLM processing
-    """
     lines = raw_text.split('\n')
     cleaned_lines = []
     for line in lines:
-        # Replace common table characters with space
         clean = line.replace('|', ' ').replace('_', ' ').replace('—', ' ')
-        # Remove empty checkboxes/brackets
         clean = re.sub(r'\[\s*\]', '', clean)
         clean = re.sub(r'\(\s*\)', '', clean)
-        # Collapse whitespace
         clean = re.sub(r'\s+', ' ', clean).strip()
-        
-        # Filter out tiny noise lines (less than 3 chars)
         if len(clean) > 2:
             cleaned_lines.append(clean)
     return "\n".join(cleaned_lines)
 
-
 def order_points(pts):
-    """
-    Order corner points: top-left, top-right, bottom-right, bottom-left.
-    Essential for correct perspective transformation.
-    """
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -116,11 +67,7 @@ def order_points(pts):
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-
 def four_point_transform(image, pts):
-    """
-    Apply perspective transformation to flatten the document.
-    """
     rect = order_points(pts)
     (tl, tr, br, bl) = rect
     widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
@@ -137,9 +84,8 @@ def four_point_transform(image, pts):
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
-
 # ============================================================================
-# IMAGE PREPROCESSING PIPELINE (v8.2 - Tuned for Cloud RAM)
+# IMAGE PREPROCESSING PIPELINE (v9.0 - Otsu)
 # ============================================================================
 
 def advanced_preprocess(img_array):
@@ -148,10 +94,10 @@ def advanced_preprocess(img_array):
         raise ValueError("Image decoding failed")
 
     # --- STAGE 1: Memory-Optimized AI Detection ---
-    # Resize to 1024px for the AI detection step (Saves ~400MB RAM)
     scale_factor = 1.0
     h, w = original.shape[:2]
     
+    # 1024px limit for AI mask generation (Saves RAM)
     if w > 1024:
         scale_factor = 1024 / w
         input_for_ai = cv2.resize(original, (1024, int(h * scale_factor)))
@@ -161,7 +107,6 @@ def advanced_preprocess(img_array):
     warped = original
     
     try:
-        # Run U-2-Net on the smaller image
         pil_img = Image.fromarray(cv2.cvtColor(input_for_ai, cv2.COLOR_BGR2RGB))
         no_bg = remove(pil_img, session=session)
         
@@ -195,13 +140,12 @@ def advanced_preprocess(img_array):
     gc.collect()
 
     # --- STAGE 2: Gamma Correction ---
-    # 0.5 Darkens mid-tones to make faint text bold
+    # 0.5 makes text "thicker" / bolder
     warped = adjust_gamma(warped, gamma=0.5)
 
-    # --- STAGE 3: Moderate Upscaling ---
-    # 1800px is the "Goldilocks" zone: 
-    # High enough for text, Low enough for 512MB RAM.
-    target_width = 1800
+    # --- STAGE 3: Upscaling (2000px) ---
+    # We push back to 2000px for better definition
+    target_width = 2000
     scale = target_width / warped.shape[1]
     if scale > 1:
         dim = (target_width, int(warped.shape[0] * scale))
@@ -209,17 +153,14 @@ def advanced_preprocess(img_array):
 
     # --- STAGE 4: Denoising ---
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    
+    # Gaussian Blur is REQUIRED for Otsu to work well
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # --- STAGE 5: Adaptive Thresholding (RE-CALIBRATED) ---
-    # Block Size: 31 (Smaller block for 1800px resolution)
-    # C: 11 (Lower value = more sensitive to faint text)
-    binary = cv2.adaptiveThreshold(
-        gray, 255, 
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 
-        31, 11 
-    )
+    # --- STAGE 5: Otsu's Binarization (THE FIX) ---
+    # Replaces Adaptive Threshold. 
+    # Global thresholding keeps bold text solid, preventing "hollow" letters.
+    ret, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     # --- STAGE 6: Vertical Line Removal ---
     clean = remove_vertical_lines(binary)
@@ -229,34 +170,24 @@ def advanced_preprocess(img_array):
 
     return clean
 
-
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
 
 @app.post("/ocr")
 async def get_ocr(file: UploadFile = File(...)):
-    """
-    Extract text from uploaded image using optimized OCR pipeline.
-    
-    Includes explicit memory cleanup (del, gc.collect) after processing 
-    to ensure stability on low-RAM containers.
-    """
     try:
         contents = await file.read()
         nparr = np.frombuffer(contents, np.uint8)
         
-        # Run optimized preprocessing
         processed_img = advanced_preprocess(nparr)
         
-        # Tesseract Configuration:
-        # --psm 6: Assume a single uniform block of text (Best for tables)
         custom_config = r'--oem 1 --psm 6' 
         raw_text = pytesseract.image_to_string(processed_img, config=custom_config)
         
         clean_text = clean_text_for_llm(raw_text)
         
-        # CRITICAL: Free memory immediately
+        # Cleanup
         del processed_img
         del nparr
         gc.collect()
@@ -265,19 +196,14 @@ async def get_ocr(file: UploadFile = File(...)):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-
 @app.post("/debug-view")
 async def debug_view(file: UploadFile = File(...)):
-    """
-    Return processed image for debugging.
-    """
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     processed_img = advanced_preprocess(nparr)
     _, encoded_img = cv2.imencode('.jpg', processed_img)
     return Response(content=encoded_img.tobytes(), media_type="image/jpeg")
 
-
 @app.get("/")
 def home():
-    return {"message": "✅ OCR Backend Service - v8.0 (Low Memory Optimized)"}
+    return {"message": "✅ OCR Backend Service - v3.0 (Otsu Edition)"}
