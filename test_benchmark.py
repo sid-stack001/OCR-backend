@@ -5,7 +5,7 @@ import time
 # --- CONFIGURATION ---
 BASE_URL = "http://localhost:8080"
 # ⚠️ REPLACE THIS with your exact filename
-TEST_IMAGE = r"F:\pihealth\supposed_OCR\lbmaske\GUR-0425-CL-0196324_INW_GUR-0425-CL-0196324_27042025165908.pdf_page_16.png"
+TEST_IMAGE = r"path_to.png"
 
 def run_test():
     if not os.path.exists(TEST_IMAGE):
