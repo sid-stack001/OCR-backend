@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+opencv-python-headless
+pytesseract
+numpy
+pillow
+rembg[cpu]
+onnxruntime
