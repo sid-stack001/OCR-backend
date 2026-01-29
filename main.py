@@ -139,40 +139,16 @@ def four_point_transform(image, pts):
 
 
 # ============================================================================
-# IMAGE PREPROCESSING PIPELINE (v8.0 - Low Memory)
+# IMAGE PREPROCESSING PIPELINE (v8.2 - Tuned for Cloud RAM)
 # ============================================================================
 
 def advanced_preprocess(img_array):
-    """
-    Execute optimized image preprocessing pipeline for OCR.
-    
-    v8.0 Optimization Strategy:
-    - Downscale input for AI detection (massive RAM savings)
-    - Upscale output to 2000px (instead of 3000px)
-    - Aggressive variable deletion and garbage collection
-    
-    Pipeline stages:
-    1. Smart Downscaling & AI Crop
-    2. Gamma Correction
-    3. Moderate Upscaling (2000px)
-    4. Bilateral Filtering
-    5. Adaptive Thresholding
-    6. Vertical Line Removal
-    7. Padding
-    
-    Args:
-        img_array (np.ndarray): Raw image bytes
-    
-    Returns:
-        np.ndarray: Processed binary image
-    """
     original = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
     if original is None: 
         raise ValueError("Image decoding failed")
 
     # --- STAGE 1: Memory-Optimized AI Detection ---
-    # Problem: U-2-Net uses massive RAM on 4K images.
-    # Solution: Resize input to 1024px width for detection only.
+    # Resize to 1024px for the AI detection step (Saves ~400MB RAM)
     scale_factor = 1.0
     h, w = original.shape[:2]
     
@@ -189,7 +165,6 @@ def advanced_preprocess(img_array):
         pil_img = Image.fromarray(cv2.cvtColor(input_for_ai, cv2.COLOR_BGR2RGB))
         no_bg = remove(pil_img, session=session)
         
-        # Free memory immediately after AI step
         del pil_img
         gc.collect()
 
@@ -198,39 +173,35 @@ def advanced_preprocess(img_array):
         
         if cnts:
             c = max(cnts, key=cv2.contourArea)
-            # Check if contour is significant (>10% of image area)
             if cv2.contourArea(c) > (0.10 * (input_for_ai.shape[0]*input_for_ai.shape[1])):
                 peri = cv2.arcLength(c, True)
                 approx = cv2.approxPolyDP(c, 0.02 * peri, True)
                 
-                # Scale contours back up to original resolution
                 if scale_factor != 1.0:
                     approx = (approx / scale_factor).astype(np.float32)
 
                 if len(approx) == 4:
                     warped = four_point_transform(original, approx.reshape(4, 2))
                 else:
-                    # Fallback to bounding box if 4 corners not found
                     rect = cv2.minAreaRect(c)
                     box = cv2.boxPoints(rect)
                     if scale_factor != 1.0:
                         box = (box / scale_factor).astype(np.float32)
                     box = np.int32(box)
                     warped = four_point_transform(original, box)
-    except Exception as e:
-        print(f"Warning: AI Crop failed ({e}), using original image.")
+    except Exception:
         warped = original
 
-    # Explicit cleanup
     gc.collect()
 
     # --- STAGE 2: Gamma Correction ---
-    # 0.5 Darkens mid-tones to make faint text (thin fonts) bold
+    # 0.5 Darkens mid-tones to make faint text bold
     warped = adjust_gamma(warped, gamma=0.5)
 
     # --- STAGE 3: Moderate Upscaling ---
-    # Reduced from 3000px -> 2000px to prevent OOM on Cloud Free Tier
-    target_width = 2000
+    # 1800px is the "Goldilocks" zone: 
+    # High enough for text, Low enough for 512MB RAM.
+    target_width = 1800
     scale = target_width / warped.shape[1]
     if scale > 1:
         dim = (target_width, int(warped.shape[0] * scale))
@@ -240,13 +211,14 @@ def advanced_preprocess(img_array):
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    # --- STAGE 5: Adaptive Thresholding ---
-    # Block Size adjusted to 51 (from 61) due to lower resolution (2000px)
+    # --- STAGE 5: Adaptive Thresholding (RE-CALIBRATED) ---
+    # Block Size: 31 (Smaller block for 1800px resolution)
+    # C: 11 (Lower value = more sensitive to faint text)
     binary = cv2.adaptiveThreshold(
         gray, 255, 
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
         cv2.THRESH_BINARY, 
-        51, 15 
+        31, 11 
     )
 
     # --- STAGE 6: Vertical Line Removal ---
