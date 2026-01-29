@@ -5,7 +5,7 @@ This version switches to Otsu's Binarization to solve the "Hollow Bold Text"
 problem found in previous versions. It is robust for bold medical headers.
 
 Author: Siddharth Verma
-Version: 9.0
+Version: 3.0
 """
 
 import cv2
